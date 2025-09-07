@@ -10,7 +10,6 @@ method ReverseNumber(n: int) returns (rev: int)
     
     while num > 0
         // TODO: Write loop invariant(s)
-        
         decreases num
     {
         var digit := num % 10;
