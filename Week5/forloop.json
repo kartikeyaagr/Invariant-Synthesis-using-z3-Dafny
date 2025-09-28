@@ -1,0 +1,54 @@
+{
+  "methods": [
+    {
+      "name": "Factorial",
+      "parameters": [
+        "n",
+        "int"
+      ],
+      "preconditions": [
+        "n >= 0"
+      ],
+      "postconditions": [
+        "result >= 1"
+      ],
+      "local_variables": [],
+      "loops": [
+        {
+          "variables": [
+            "i",
+            "n",
+            "to"
+          ],
+          "loop_type": "for",
+          "condition": "i := 1 to n",
+          "invariants": [
+            "1 <= i <= n + 1",
+            "result >= 1"
+          ]
+        }
+      ]
+    }
+  ],
+  "loops": [
+    {
+      "variables": [
+        "i",
+        "n",
+        "to"
+      ],
+      "loop_type": "for",
+      "condition": "i := 1 to n",
+      "invariants": [
+        "1 <= i <= n + 1",
+        "result >= 1"
+      ]
+    }
+  ],
+  "preconditions": [
+    "n >= 0"
+  ],
+  "postconditions": [
+    "result >= 1"
+  ]
+}
