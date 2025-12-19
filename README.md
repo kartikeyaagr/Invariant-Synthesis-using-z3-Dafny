@@ -306,7 +306,3 @@ The pipeline uses `importlib` to load week-specific modules, avoiding conflicts 
 2. Gulwani, S., Srivastava, S., & Venkatesan, R. (2008). Program analysis as constraint solving. PLDI.
 3. Sharma, R., & Aiken, A. (2010). From invariant checking to invariant inference. CAV.
 4. Furia, C. A., Meyer, B., & Velder, S. (2014). Loop invariants: Analysis, classification, and examples. ACM Computing Surveys.
-
-## License
-
-Academic use. See individual week folders for specific licenses.
