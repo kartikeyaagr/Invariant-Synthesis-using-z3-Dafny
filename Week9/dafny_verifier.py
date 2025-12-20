@@ -1,6 +1,7 @@
 """
 Dafny Verifier Module
 Validates synthesized invariants by running Dafny verification.
+Supports combining multiple invariants together.
 """
 
 import subprocess
@@ -9,6 +10,7 @@ import os
 import re
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
+from itertools import combinations
 
 
 @dataclass
@@ -103,9 +105,15 @@ class DafnyVerifier:
     
     def verify_with_invariant(self, source: str, invariant: str) -> VerificationResult:
         """
-        Verify source with an additional invariant inserted.
+        Verify source with a single invariant inserted.
         """
-        # Find while loop and insert invariant
+        return self.verify_with_invariants(source, [invariant])
+    
+    def verify_with_invariants(self, source: str, invariants: List[str]) -> VerificationResult:
+        """
+        Verify source with multiple invariants inserted together.
+        """
+        # Find while loop and insert all invariants
         lines = source.split('\n')
         new_lines = []
         inserted = False
@@ -113,12 +121,15 @@ class DafnyVerifier:
         for line in lines:
             new_lines.append(line)
             
-            # Insert after while line (before opening brace)
-            if not inserted and 'while' in line:
+            # Insert after while line (before any existing invariants or the body)
+            if not inserted and 'while' in line and not line.strip().startswith('//'):
                 # Find indentation
                 indent = len(line) - len(line.lstrip())
-                inv_indent = ' ' * (indent + 2)
-                new_lines.append(f"{inv_indent}invariant {invariant}")
+                inv_indent = ' ' * (indent + 4)
+                
+                # Insert all invariants
+                for inv in invariants:
+                    new_lines.append(f"{inv_indent}invariant {inv}")
                 inserted = True
         
         modified_source = '\n'.join(new_lines)
@@ -156,6 +167,53 @@ class DafnyVerifier:
                 valid.append(inv)
         
         return valid
+    
+    def find_minimal_valid_set(self, source: str, 
+                                candidates: List[str],
+                                max_combo_size: int = 4) -> Optional[List[str]]:
+        """
+        Find a minimal set of invariants that together verify the program.
+        Tries combinations of increasing size until one works.
+        
+        Args:
+            source: Dafny source code
+            candidates: List of candidate invariants
+            max_combo_size: Maximum number of invariants to combine
+            
+        Returns:
+            A list of invariants that together verify, or None if none found
+        """
+        # Try combinations of increasing size
+        for size in range(1, min(max_combo_size + 1, len(candidates) + 1)):
+            for combo in combinations(candidates, size):
+                result = self.verify_with_invariants(source, list(combo))
+                if result.success:
+                    return list(combo)
+        
+        return None
+    
+    def find_all_valid_sets(self, source: str,
+                            candidates: List[str],
+                            max_combo_size: int = 3,
+                            max_results: int = 5) -> List[List[str]]:
+        """
+        Find multiple valid sets of invariants.
+        
+        Returns:
+            List of valid invariant combinations
+        """
+        valid_sets = []
+        
+        for size in range(1, min(max_combo_size + 1, len(candidates) + 1)):
+            for combo in combinations(candidates, size):
+                if len(valid_sets) >= max_results:
+                    return valid_sets
+                    
+                result = self.verify_with_invariants(source, list(combo))
+                if result.success:
+                    valid_sets.append(list(combo))
+        
+        return valid_sets
 
 
 class InvariantValidator:
@@ -201,15 +259,11 @@ class InvariantValidator:
         Check all three invariant conditions.
         Returns (init_ok, preserve_ok, useful_ok)
         """
-        # For now, delegate to full verification
         result = self.verifier.verify_with_invariant(source, invariant)
         
-        # If full verification passes, all conditions are satisfied
         if result.success:
             return (True, True, True)
         
-        # Otherwise, we'd need to check individually
-        # This is a simplification
         return (False, False, False)
 
 
@@ -217,19 +271,18 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) < 2:
-        print("Usage: python dafny_verifier.py <file.dfy> [invariant]")
+        print("Usage: python dafny_verifier.py <file.dfy> [invariant1] [invariant2] ...")
         sys.exit(1)
     
     verifier = DafnyVerifier()
     
     if len(sys.argv) == 2:
-        # Verify file as-is
         result = verifier.verify_file(sys.argv[1])
     else:
-        # Verify with additional invariant
         with open(sys.argv[1], 'r') as f:
             source = f.read()
-        result = verifier.verify_with_invariant(source, sys.argv[2])
+        invariants = sys.argv[2:]
+        result = verifier.verify_with_invariants(source, invariants)
     
     print(f"Success: {result.success}")
     print(f"Verified: {result.verified_count}, Errors: {result.error_count}")

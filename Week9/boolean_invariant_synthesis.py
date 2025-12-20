@@ -4,9 +4,11 @@ Synthesizes boolean combinations of linear invariants for Dafny programs.
 
 Supports:
 - Single linear invariants: ax + by <= c
+- Single linear equalities: ax + by == c
 - Conjunctions: (ax + by <= c) && (dx + ey <= f)
 - Disjunctions: (ax + by <= c) || (dx + ey <= f)
-- Mixed: (ax + by <= c) && ((dx + ey <= f) || (gx + hy <= i))
+- Diverse solutions (blocks duplicates)
+- Parameter handling (n in requires n >= 0)
 """
 
 import sys
@@ -17,7 +19,7 @@ from dataclasses import dataclass
 
 from dafny_parser import DafnyExtractor
 from z3_boolean_solver import (
-    Z3BooleanSolver, BooleanInvariant, LinearConstraint, BoolOp
+    Z3BooleanSolver, BooleanInvariant, LinearConstraint, BoolOp, ConstraintType
 )
 
 
@@ -40,32 +42,56 @@ class BooleanInvariantSynthesizer:
         self.solver = Z3BooleanSolver(coeff_bound=coeff_bound)
         self.max_constraints = max_constraints
     
-    def parse_initial_values(self, method_body: str, var_names: List[str]) -> Dict[str, int]:
-        """Extract initial values from method body before the loop"""
+    def parse_initial_values(self, method_body: str, var_names: List[str], 
+                             parameters: List[str] = None) -> Dict[str, int]:
+        """
+        Extract initial values from method body before the loop.
+        Parameters are treated symbolically (init value 0 for simulation).
+        """
         init_values = {}
+        parameters = parameters or []
         
         for var in var_names:
-            # Look for patterns like: var := 0; or x := 0;
+            # Parameters don't have initial assignments in body - use 0 for symbolic
+            if var in parameters:
+                init_values[var] = 0
+                continue
+            
+            # Look for patterns like: var x := 0; or x := 0;
             patterns = [
-                rf'{var}\s*:=\s*(-?\d+)',
-                rf'var\s+{var}\s*:=\s*(-?\d+)',
+                rf'var\s+{var}\s*:=\s*(-?\d+)',           # var x := 0
+                rf'var\s+{var}\s*:\s*\w+\s*:=\s*(-?\d+)', # var x: int := 0
+                rf'\b{var}\s*:=\s*(-?\d+)',               # x := 0
             ]
+            
+            found = False
             for pattern in patterns:
                 match = re.search(pattern, method_body)
                 if match:
                     init_values[var] = int(match.group(1))
+                    found = True
                     break
             
-            if var not in init_values:
+            if not found:
                 init_values[var] = 0
         
         return init_values
     
-    def parse_update_expressions(self, loop_body: str, var_names: List[str]) -> Dict[str, str]:
-        """Extract update expressions from loop body"""
+    def parse_update_expressions(self, loop_body: str, var_names: List[str],
+                                 parameters: List[str] = None) -> Dict[str, str]:
+        """
+        Extract update expressions from loop body.
+        Parameters typically don't change inside the loop.
+        """
         updates = {}
+        parameters = parameters or []
         
         for var in var_names:
+            # Parameters usually don't get updated in loop
+            if var in parameters:
+                updates[var] = "+0"
+                continue
+            
             # Match: var := var + n, var := var - n, etc.
             patterns = [
                 (rf'{var}\s*:=\s*{var}\s*\+\s*(\d+)', '+'),
@@ -74,20 +100,48 @@ class BooleanInvariantSynthesizer:
                 (rf'{var}\s*:=\s*(\d+)\s*\+\s*{var}', '+'),
             ]
             
+            found = False
             for pattern, op in patterns:
                 match = re.search(pattern, loop_body)
                 if match:
                     updates[var] = f"{op}{match.group(1)}"
+                    found = True
                     break
             
-            if var not in updates:
+            if not found:
                 updates[var] = "+0"
         
         return updates
     
+    def extract_method_body(self, source: str, method_name: str) -> str:
+        """Extract the full method body from source"""
+        pattern = rf'method\s+{method_name}\s*\([^)]*\)'
+        match = re.search(pattern, source)
+        if not match:
+            return ""
+        
+        rest = source[match.end():]
+        brace_pos = rest.find('{')
+        if brace_pos == -1:
+            return ""
+        
+        start = match.end() + brace_pos + 1
+        brace_count = 1
+        end = start
+        
+        while end < len(source) and brace_count > 0:
+            if source[end] == '{':
+                brace_count += 1
+            elif source[end] == '}':
+                brace_count -= 1
+            end += 1
+        
+        return source[start:end-1]
+    
     def synthesize_for_loop(self, loop_info: Dict, 
                             method_body: str = "",
-                            preconditions: List[str] = None) -> List[BooleanInvariant]:
+                            preconditions: List[str] = None,
+                            parameters: List[str] = None) -> List[BooleanInvariant]:
         """Synthesize invariants for a single loop"""
         var_names = loop_info.get('variables', [])
         loop_body = loop_info.get('body', '')
@@ -96,49 +150,43 @@ class BooleanInvariantSynthesizer:
         if not var_names:
             return []
         
-        # Get initial values
-        init_values = self.parse_initial_values(method_body, var_names)
+        # Get initial values (handling parameters specially)
+        init_values = self.parse_initial_values(method_body, var_names, parameters)
         
-        # Get update expressions
+        # Get update expressions - prefer parsed updates from parser
         if body_updates:
-            updates = body_updates
+            updates = {}
+            for var in var_names:
+                if var in body_updates:
+                    updates[var] = body_updates[var]
+                elif var in (parameters or []):
+                    updates[var] = "+0"
+                else:
+                    updates[var] = "+0"
         else:
-            updates = self.parse_update_expressions(loop_body, var_names)
+            updates = self.parse_update_expressions(loop_body, var_names, parameters)
         
-        # Synthesize invariants
-        results = []
-        
-        # Try single constraints
-        inv = self.solver.solve_for_coefficients(
-            var_names, init_values, updates,
-            num_constraints=1
+        # Use the improved synthesis method
+        results = self.solver.synthesize_all_combinations(
+            var_names, init_values, updates, 
+            max_constraints=self.max_constraints
         )
-        if inv:
-            results.append(inv)
-        
-        # Try conjunctions of increasing size
-        for n in range(2, self.max_constraints + 1):
-            inv_conj = self.solver.solve_for_coefficients(
-                var_names, init_values, updates,
-                num_constraints=n, combination_type=BoolOp.AND
-            )
-            if inv_conj:
-                results.append(inv_conj)
-        
-        # Try disjunctions of increasing size
-        for n in range(2, self.max_constraints + 1):
-            inv_disj = self.solver.solve_for_coefficients(
-                var_names, init_values, updates,
-                num_constraints=n, combination_type=BoolOp.OR
-            )
-            if inv_disj:
-                results.append(inv_disj)
         
         return results
     
     def synthesize(self, dafny_file: str) -> SynthesisResult:
         """Main synthesis entry point"""
-        # Parse the Dafny file
+        try:
+            with open(dafny_file, 'r') as f:
+                source = f.read()
+        except Exception as e:
+            return SynthesisResult(
+                success=False,
+                invariants=[],
+                validated=[],
+                messages=[f"Error reading file: {e}"]
+            )
+        
         parsed = self.parser.parse_file(dafny_file)
         
         if "error" in parsed:
@@ -155,17 +203,41 @@ class BooleanInvariantSynthesizer:
         for method in parsed.get('methods', []):
             method_name = method.get('name', 'unknown')
             
+            # Get parameters - handle both tuple format and string format
+            raw_params = method.get('parameters', [])
+            parameters = []
+            for p in raw_params:
+                if isinstance(p, tuple):
+                    parameters.append(p[0])
+                elif isinstance(p, str):
+                    parameters.append(p.split(':')[0].strip())
+            
+            # Also add return variables
+            raw_returns = method.get('return_vars', [])
+            for r in raw_returns:
+                if isinstance(r, tuple):
+                    parameters.append(r[0])
+                elif isinstance(r, str):
+                    parameters.append(r.split(':')[0].strip())
+            
+            preconditions = method.get('preconditions', [])
+            method_body = self.extract_method_body(source, method_name)
+            
             for loop_idx, loop in enumerate(method.get('loops', [])):
                 messages.append(f"Synthesizing invariants for {method_name}, loop {loop_idx + 1}...")
                 
-                # Get method body for initial value extraction
-                # This is a simplification - in practice, we'd need the full body
-                method_body = ""
+                # Add parameters to loop variables if not already there
+                loop_vars = loop.get('variables', [])
+                for param in parameters:
+                    if param and param not in loop_vars:
+                        loop_vars.append(param)
+                loop['variables'] = loop_vars
                 
                 invariants = self.synthesize_for_loop(
                     loop, 
                     method_body,
-                    method.get('preconditions', [])
+                    preconditions,
+                    parameters
                 )
                 
                 if invariants:
@@ -173,14 +245,15 @@ class BooleanInvariantSynthesizer:
                     for inv in invariants:
                         inv_str = inv.to_string()
                         all_invariants.append(inv_str)
-                        messages.append(f"    - {inv_str}")
+                        eq_marker = "[EQ]" if inv.constraints[0].is_equality else "[LE]"
+                        messages.append(f"    {eq_marker} {inv_str}")
                 else:
                     messages.append("  No invariants found")
         
         return SynthesisResult(
             success=len(all_invariants) > 0,
             invariants=all_invariants,
-            validated=[False] * len(all_invariants),  # Validation done separately
+            validated=[False] * len(all_invariants),
             messages=messages
         )
     
@@ -188,18 +261,22 @@ class BooleanInvariantSynthesizer:
                              init_values: Dict[str, int],
                              updates: Dict[str, str],
                              require_conjunction: bool = False,
-                             require_disjunction: bool = False) -> List[str]:
+                             require_disjunction: bool = False,
+                             require_equality: bool = False) -> List[str]:
         """
         Synthesize invariants from a direct specification.
-        Useful for testing and direct API access.
         """
         results = []
+        
+        constraint_type = ConstraintType.EQUALITY if require_equality else ConstraintType.INEQUALITY
         
         if require_conjunction:
             for n in range(2, self.max_constraints + 1):
                 inv = self.solver.solve_for_coefficients(
                     var_names, init_values, updates,
-                    num_constraints=n, combination_type=BoolOp.AND
+                    num_constraints=n, 
+                    combination_type=BoolOp.AND,
+                    constraint_type=constraint_type
                 )
                 if inv:
                     results.append(inv.to_string())
@@ -207,7 +284,9 @@ class BooleanInvariantSynthesizer:
             for n in range(2, self.max_constraints + 1):
                 inv = self.solver.solve_for_coefficients(
                     var_names, init_values, updates,
-                    num_constraints=n, combination_type=BoolOp.OR
+                    num_constraints=n, 
+                    combination_type=BoolOp.OR,
+                    constraint_type=constraint_type
                 )
                 if inv:
                     results.append(inv.to_string())
@@ -231,13 +310,11 @@ class InvariantInserter:
         for i, line in enumerate(lines):
             new_lines.append(line)
             
-            # Check if this is a while line
-            if 'while' in line and '{' not in line:
-                # Find indentation
+            stripped = line.strip()
+            if stripped.startswith('while') and '//' not in line.split('while')[0]:
                 indent = len(line) - len(line.lstrip())
-                inv_indent = ' ' * (indent + 2)
+                inv_indent = ' ' * (indent + 4)
                 
-                # Insert invariants
                 for inv in invariants:
                     new_lines.append(f"{inv_indent}invariant {inv}")
         
@@ -280,19 +357,18 @@ def main():
                        help='Only synthesize conjunctions')
     parser.add_argument('--disjunction-only', action='store_true',
                        help='Only synthesize disjunctions')
+    parser.add_argument('--equality-only', action='store_true',
+                       help='Only synthesize equalities')
     
     args = parser.parse_args()
     
-    # Create synthesizer
     synthesizer = BooleanInvariantSynthesizer(
         coeff_bound=args.coeff_bound,
         max_constraints=args.max_constraints
     )
     
-    # Run synthesis
     result = synthesizer.synthesize(args.input)
     
-    # Output results
     if args.json:
         output = {
             "success": result.success,
@@ -309,7 +385,6 @@ def main():
         else:
             print("\nNo invariants found")
     
-    # Write output file if requested
     if args.output and result.success:
         inserter = InvariantInserter()
         if inserter.insert_in_file(args.input, args.output, result.invariants):

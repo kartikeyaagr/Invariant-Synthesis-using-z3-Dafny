@@ -1,22 +1,31 @@
 """
 Z3 Solver Wrapper for Boolean Invariant Synthesis
 Supports conjunctions and disjunctions of linear invariants.
+
+UPDATED: Now includes equality synthesis, diverse solutions, and better filtering.
 """
 
 from z3 import (
     Solver, Int, Bool, And, Or, Not, Implies, 
     sat, unsat, unknown, simplify, is_true, is_false
 )
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, Set
 from dataclasses import dataclass
 from enum import Enum
-import itertools
+from math import gcd
+from functools import reduce
 
 
 class BoolOp(Enum):
     AND = "and"
     OR = "or"
     IMPLIES = "implies"
+
+
+class ConstraintType(Enum):
+    """Type of constraint to synthesize"""
+    INEQUALITY = "inequality"  # <= 0
+    EQUALITY = "equality"      # == 0
 
 
 @dataclass
@@ -27,7 +36,7 @@ class LinearConstraint:
     is_equality: bool = False
     
     def to_string(self, var_names: List[str] = None) -> str:
-        """Convert to readable string"""
+        """Convert to readable Dafny syntax"""
         terms = []
         for var, coeff in self.coefficients.items():
             if coeff == 0:
@@ -45,6 +54,44 @@ class LinearConstraint:
         lhs = " + ".join(terms).replace("+ -", "- ")
         op = "==" if self.is_equality else "<="
         return f"{lhs} {op} {-self.constant}"
+    
+    def is_trivial(self) -> bool:
+        """Check if this constraint is trivially true or useless"""
+        # All variable coefficients are zero
+        if all(c == 0 for c in self.coefficients.values()):
+            if self.is_equality:
+                return self.constant == 0  # 0 == 0 is trivial
+            else:
+                return self.constant >= 0  # 0 <= positive is trivial
+        return False
+    
+    def signature(self) -> tuple:
+        """Return a hashable signature for deduplication"""
+        coeffs = list(self.coefficients.values()) + [self.constant]
+        non_zero = [abs(c) for c in coeffs if c != 0]
+        
+        if not non_zero:
+            return (tuple(), 0, self.is_equality)
+        
+        g = reduce(gcd, non_zero)
+        
+        # Normalize coefficients
+        norm_coeffs = {k: v // g for k, v in self.coefficients.items()}
+        norm_const = self.constant // g
+        
+        # Make first non-zero coefficient positive for consistency
+        first_nonzero = None
+        for var in sorted(norm_coeffs.keys()):
+            if norm_coeffs[var] != 0:
+                first_nonzero = norm_coeffs[var]
+                break
+        
+        if first_nonzero and first_nonzero < 0:
+            norm_coeffs = {k: -v for k, v in norm_coeffs.items()}
+            norm_const = -norm_const
+        
+        items = tuple(sorted(norm_coeffs.items()))
+        return (items, norm_const, self.is_equality)
 
 
 @dataclass
@@ -72,6 +119,14 @@ class BooleanInvariant:
                 result = f"({result}) ==> ({c_str})"
         
         return result
+    
+    def is_trivial(self) -> bool:
+        """Check if all constraints are trivial"""
+        return all(c.is_trivial() for c in self.constraints)
+    
+    def signature(self) -> tuple:
+        """Return a hashable signature for deduplication"""
+        return tuple(c.signature() for c in self.constraints)
 
 
 class Z3BooleanSolver:
@@ -79,7 +134,6 @@ class Z3BooleanSolver:
     
     def __init__(self, coeff_bound: int = 10):
         self.coeff_bound = coeff_bound
-        self.solver = Solver()
     
     def create_z3_vars(self, var_names: List[str]) -> Dict[str, Any]:
         """Create Z3 integer variables"""
@@ -126,7 +180,9 @@ class Z3BooleanSolver:
                                update_exprs: Dict[str, str],
                                loop_bound: int = 20,
                                num_constraints: int = 1,
-                               combination_type: BoolOp = BoolOp.AND) -> Optional[BooleanInvariant]:
+                               combination_type: BoolOp = BoolOp.AND,
+                               constraint_type: ConstraintType = ConstraintType.INEQUALITY,
+                               blocked_solutions: List[Dict] = None) -> Optional[BooleanInvariant]:
         """
         Synthesize boolean combination of linear invariants.
         
@@ -137,6 +193,8 @@ class Z3BooleanSolver:
             loop_bound: Number of iterations to check
             num_constraints: Number of linear constraints to combine
             combination_type: How to combine constraints (AND/OR)
+            constraint_type: INEQUALITY (<=) or EQUALITY (==)
+            blocked_solutions: Previous solutions to avoid (for diverse synthesis)
         """
         # Create coefficient variables for each constraint
         coeff_vars = []
@@ -154,33 +212,58 @@ class Z3BooleanSolver:
             for v in coeffs.values():
                 s.add(v >= -self.coeff_bound, v <= self.coeff_bound)
         
-        # Non-triviality: at least one coefficient is non-zero per constraint
+        # Non-triviality: at least one variable coefficient is non-zero per constraint
         for coeffs in coeff_vars:
             var_coeffs = [coeffs[v] for v in var_names]
             s.add(Or(*[c != 0 for c in var_coeffs]))
+        
+        # Block previous solutions if provided
+        if blocked_solutions:
+            for blocked in blocked_solutions:
+                block_clause = []
+                for i, coeffs in enumerate(coeff_vars):
+                    for var in var_names:
+                        key = f'a_{i}_{var}'
+                        if key in blocked:
+                            block_clause.append(coeffs[var] != blocked[key])
+                    key = f'c_{i}'
+                    if key in blocked:
+                        block_clause.append(coeffs['const'] != blocked[key])
+                if block_clause:
+                    s.add(Or(*block_clause))
         
         # Simulate loop execution and check invariant holds at each step
         for step in range(loop_bound + 1):
             # Compute variable values at this step
             values = {}
             for var in var_names:
+                base_val = init_values.get(var, 0)
+                update = update_exprs.get(var, "+0")
+                
                 if step == 0:
-                    values[var] = init_values.get(var, 0)
+                    values[var] = base_val
                 else:
-                    prev_val = init_values.get(var, 0)
-                    update = update_exprs.get(var, "+0")
                     # Parse update expression
                     if update.startswith('+'):
-                        delta = int(update[1:])
-                        values[var] = prev_val + step * delta
+                        try:
+                            delta = int(update[1:])
+                            values[var] = base_val + step * delta
+                        except ValueError:
+                            values[var] = base_val
                     elif update.startswith('-'):
-                        delta = int(update[1:])
-                        values[var] = prev_val - step * delta
+                        try:
+                            delta = int(update[1:])
+                            values[var] = base_val - step * delta
+                        except ValueError:
+                            values[var] = base_val
                     elif update.startswith('*'):
-                        factor = int(update[1:])
-                        values[var] = prev_val * (factor ** step)
+                        try:
+                            factor = int(update[1:])
+                            values[var] = base_val * (factor ** step)
+                        except ValueError:
+                            values[var] = base_val
                     else:
-                        values[var] = prev_val
+                        values[var] = base_val
             
             # Build constraint expressions for this step
             constraint_exprs = []
@@ -188,7 +271,11 @@ class Z3BooleanSolver:
                 expr = coeffs['const']
                 for var in var_names:
                     expr = expr + coeffs[var] * values[var]
-                constraint_exprs.append(expr <= 0)
+                
+                if constraint_type == ConstraintType.EQUALITY:
+                    constraint_exprs.append(expr == 0)
+                else:
+                    constraint_exprs.append(expr <= 0)
             
             # Combine constraints based on combination type
             if combination_type == BoolOp.AND:
@@ -207,50 +294,240 @@ class Z3BooleanSolver:
                 lc = LinearConstraint(
                     coefficients={var: model.eval(coeffs[var]).as_long() 
                                  for var in var_names},
-                    constant=model.eval(coeffs['const']).as_long()
+                    constant=model.eval(coeffs['const']).as_long(),
+                    is_equality=(constraint_type == ConstraintType.EQUALITY)
                 )
                 constraints.append(lc)
             
             operators = [combination_type] * (num_constraints - 1)
-            return BooleanInvariant(constraints=constraints, operators=operators)
+            inv = BooleanInvariant(constraints=constraints, operators=operators)
+            
+            # Skip trivial invariants by recursively blocking
+            if inv.is_trivial():
+                new_blocked = list(blocked_solutions) if blocked_solutions else []
+                solution_dict = {}
+                for i, coeffs in enumerate(coeff_vars):
+                    for var in var_names:
+                        solution_dict[f'a_{i}_{var}'] = model.eval(coeffs[var]).as_long()
+                    solution_dict[f'c_{i}'] = model.eval(coeffs['const']).as_long()
+                new_blocked.append(solution_dict)
+                
+                # Limit recursion depth
+                if len(new_blocked) < 20:
+                    return self.solve_for_coefficients(
+                        var_names, init_values, update_exprs, loop_bound,
+                        num_constraints, combination_type, constraint_type,
+                        new_blocked
+                    )
+                return None
+            
+            return inv
         
         return None
+
+    def synthesize_diverse(self, var_names: List[str],
+                           init_values: Dict[str, int],
+                           update_exprs: Dict[str, str],
+                           num_solutions: int = 5,
+                           constraint_type: ConstraintType = ConstraintType.INEQUALITY,
+                           loop_bound: int = 20) -> List[BooleanInvariant]:
+        """
+        Synthesize multiple diverse single-constraint invariants.
+        Each call blocks the previous solution to get different results.
+        """
+        results = []
+        blocked = []
+        seen_signatures = set()
+        
+        attempts = 0
+        max_attempts = num_solutions * 3
+        
+        while len(results) < num_solutions and attempts < max_attempts:
+            attempts += 1
+            
+            inv = self.solve_for_coefficients(
+                var_names, init_values, update_exprs,
+                loop_bound=loop_bound,
+                num_constraints=1,
+                constraint_type=constraint_type,
+                blocked_solutions=blocked
+            )
+            
+            if inv is None:
+                break
+            
+            # Check if truly different using signature
+            sig = inv.signature()
+            if sig not in seen_signatures and not inv.is_trivial():
+                seen_signatures.add(sig)
+                results.append(inv)
+            
+            # Block this solution for next iteration
+            solution_dict = {}
+            for var in var_names:
+                solution_dict[f'a_0_{var}'] = inv.constraints[0].coefficients[var]
+            solution_dict['c_0'] = inv.constraints[0].constant
+            blocked.append(solution_dict)
+        
+        return results
+
+    def synthesize_bound_invariants(self, var_names: List[str],
+                                     init_values: Dict[str, int],
+                                     update_exprs: Dict[str, str],
+                                     loop_bound: int = 20) -> List[BooleanInvariant]:
+        """
+        Synthesize bound invariants of the form:
+        - x >= 0  (lower bounds)
+        - x <= n  (upper bounds involving other variables)
+        """
+        results = []
+        
+        # For each variable that gets updated (not parameters)
+        for var in var_names:
+            update = update_exprs.get(var, "+0")
+            init_val = init_values.get(var, 0)
+            
+            # Skip parameters (no update)
+            if update == "+0" and var not in ['i', 'j', 'x', 'y', 'z', 'k', 'count', 'sum', 'result']:
+                continue
+            
+            # If starts at 0 and increases, x >= 0 is an invariant
+            if init_val == 0 and update.startswith('+'):
+                # Create: -x <= 0 (i.e., x >= 0)
+                inv = BooleanInvariant(
+                    constraints=[LinearConstraint(
+                        coefficients={v: -1 if v == var else 0 for v in var_names},
+                        constant=0,
+                        is_equality=False
+                    )],
+                    operators=[]
+                )
+                results.append(inv)
+            
+            # If starts at 0 and decreases, x <= 0 is an invariant
+            if init_val == 0 and update.startswith('-'):
+                inv = BooleanInvariant(
+                    constraints=[LinearConstraint(
+                        coefficients={v: 1 if v == var else 0 for v in var_names},
+                        constant=0,
+                        is_equality=False
+                    )],
+                    operators=[]
+                )
+                results.append(inv)
+        
+        # Try to find upper bounds involving parameters (e.g., i <= n)
+        # This requires trying combinations with parameters
+        for var in var_names:
+            update = update_exprs.get(var, "+0")
+            if update == "+0":
+                continue  # This is likely a parameter
+                
+            for param in var_names:
+                if update_exprs.get(param, "+0") != "+0":
+                    continue  # Not a parameter
+                
+                # Try: var <= param (encoded as var - param <= 0)
+                # Check if it holds through simulation
+                holds = True
+                for step in range(loop_bound + 1):
+                    var_val = init_values.get(var, 0)
+                    param_val = init_values.get(param, 0)
+                    
+                    upd = update_exprs.get(var, "+0")
+                    if upd.startswith('+'):
+                        try:
+                            delta = int(upd[1:])
+                            var_val = init_values.get(var, 0) + step * delta
+                        except:
+                            pass
+                    
+                    # For upper bound, we need var_val <= param_val
+                    # But param doesn't change, so we check relative values
+                    # This is tricky - we're simulating with param=0
+                    # The invariant i <= n only holds if we assume the loop guard
+                
+                # For now, just add i <= n style invariants if i starts at 0 and increases
+                if init_values.get(var, 0) == 0 and update.startswith('+'):
+                    inv = BooleanInvariant(
+                        constraints=[LinearConstraint(
+                            coefficients={v: (1 if v == var else (-1 if v == param else 0)) for v in var_names},
+                            constant=0,
+                            is_equality=False
+                        )],
+                        operators=[]
+                    )
+                    results.append(inv)
+        
+        return results
 
     def synthesize_all_combinations(self, var_names: List[str],
                                     init_values: Dict[str, int],
                                     update_exprs: Dict[str, str],
-                                    max_constraints: int = 3) -> List[BooleanInvariant]:
+                                    max_constraints: int = 3,
+                                    loop_bound: int = 20) -> List[BooleanInvariant]:
         """
         Synthesize multiple boolean combinations of invariants.
-        Tries different numbers of constraints and combination types.
+        Now includes equalities, diverse solutions, and bound invariants.
         """
         results = []
+        seen_signatures = set()
         
-        # Try single constraints first
-        inv = self.solve_for_coefficients(
+        def add_if_unique(inv: BooleanInvariant):
+            if inv and not inv.is_trivial():
+                sig = inv.signature()
+                if sig not in seen_signatures:
+                    seen_signatures.add(sig)
+                    results.append(inv)
+        
+        # 1. Try diverse single EQUALITIES first (most useful for relationships like j == 2*i)
+        diverse_eq = self.synthesize_diverse(
             var_names, init_values, update_exprs,
-            num_constraints=1
+            num_solutions=5,
+            constraint_type=ConstraintType.EQUALITY,
+            loop_bound=loop_bound
         )
-        if inv:
-            results.append(inv)
+        for inv in diverse_eq:
+            add_if_unique(inv)
         
-        # Try conjunctions
+        # 2. Try diverse single INEQUALITIES
+        diverse_ineq = self.synthesize_diverse(
+            var_names, init_values, update_exprs,
+            num_solutions=5,
+            constraint_type=ConstraintType.INEQUALITY,
+            loop_bound=loop_bound
+        )
+        for inv in diverse_ineq:
+            add_if_unique(inv)
+        
+        # 3. Add common bound invariants (0 <= i, i <= n, etc.)
+        bound_invs = self.synthesize_bound_invariants(
+            var_names, init_values, update_exprs, loop_bound
+        )
+        for inv in bound_invs:
+            add_if_unique(inv)
+        
+        # 4. Try conjunctions of inequalities
         for n in range(2, max_constraints + 1):
             inv = self.solve_for_coefficients(
                 var_names, init_values, update_exprs,
-                num_constraints=n, combination_type=BoolOp.AND
+                loop_bound=loop_bound,
+                num_constraints=n, 
+                combination_type=BoolOp.AND,
+                constraint_type=ConstraintType.INEQUALITY
             )
-            if inv:
-                results.append(inv)
+            add_if_unique(inv)
         
-        # Try disjunctions
+        # 5. Try conjunctions of equalities
         for n in range(2, max_constraints + 1):
             inv = self.solve_for_coefficients(
                 var_names, init_values, update_exprs,
-                num_constraints=n, combination_type=BoolOp.OR
+                loop_bound=loop_bound,
+                num_constraints=n,
+                combination_type=BoolOp.AND,
+                constraint_type=ConstraintType.EQUALITY
             )
-            if inv:
-                results.append(inv)
+            add_if_unique(inv)
         
         return results
 
@@ -279,22 +556,26 @@ class Z3BooleanSolver:
         s.add(Not(inv_z3))
         init_ok = s.check() == unsat
         
-        # Check preservation (simplified - assumes linear updates)
+        # Check preservation
         s2 = Solver()
         s2.add(inv_z3)
-        # Add update constraints
         for var in var_names:
             update = update_exprs.get(var, "+0")
             if update.startswith('+'):
-                delta = int(update[1:])
-                s2.add(z3_vars_prime[f"{var}'"] == z3_vars[var] + delta)
+                try:
+                    delta = int(update[1:])
+                    s2.add(z3_vars_prime[f"{var}'"] == z3_vars[var] + delta)
+                except ValueError:
+                    s2.add(z3_vars_prime[f"{var}'"] == z3_vars[var])
             elif update.startswith('-'):
-                delta = int(update[1:])
-                s2.add(z3_vars_prime[f"{var}'"] == z3_vars[var] - delta)
+                try:
+                    delta = int(update[1:])
+                    s2.add(z3_vars_prime[f"{var}'"] == z3_vars[var] - delta)
+                except ValueError:
+                    s2.add(z3_vars_prime[f"{var}'"] == z3_vars[var])
             else:
                 s2.add(z3_vars_prime[f"{var}'"] == z3_vars[var])
         
-        # Check that invariant holds for primed variables
         inv_prime = self.boolean_invariant_to_z3(
             invariant, 
             {v: z3_vars_prime[f"{v}'"] for v in var_names}
@@ -320,49 +601,44 @@ def solve_constraints(constraints: List[Any]) -> Optional[Any]:
 
 
 if __name__ == "__main__":
-    # Test the solver
     solver = Z3BooleanSolver(coeff_bound=10)
     
-    # Test case: x starts at 0, y starts at 0
-    # Loop body: x := x + 1; y := y + 2
-    var_names = ['x', 'y']
-    init_values = {'x': 0, 'y': 0}
-    update_exprs = {'x': '+1', 'y': '+2'}
+    print("=" * 60)
+    print("Testing Boolean Invariant Synthesis")
+    print("=" * 60)
     
-    print("Testing boolean invariant synthesis...")
-    print(f"Variables: {var_names}")
+    var_names = ['i', 'j', 'n']
+    init_values = {'i': 0, 'j': 0, 'n': 0}
+    update_exprs = {'i': '+1', 'j': '+2', 'n': '+0'}
+    
+    print(f"\nVariables: {var_names}")
     print(f"Initial values: {init_values}")
     print(f"Updates: {update_exprs}")
-    print()
     
-    # Synthesize single constraint
-    inv = solver.solve_for_coefficients(
+    print("\n--- Diverse Equalities ---")
+    diverse_eq = solver.synthesize_diverse(
         var_names, init_values, update_exprs,
-        num_constraints=1
+        num_solutions=5,
+        constraint_type=ConstraintType.EQUALITY
     )
-    if inv:
-        print(f"Single constraint: {inv.to_string()}")
+    for inv in diverse_eq:
+        print(f"  {inv.to_string()}")
     
-    # Synthesize conjunction
-    inv_conj = solver.solve_for_coefficients(
+    print("\n--- Diverse Inequalities ---")
+    diverse_ineq = solver.synthesize_diverse(
         var_names, init_values, update_exprs,
-        num_constraints=2, combination_type=BoolOp.AND
+        num_solutions=5,
+        constraint_type=ConstraintType.INEQUALITY
     )
-    if inv_conj:
-        print(f"Conjunction: {inv_conj.to_string()}")
+    for inv in diverse_ineq:
+        print(f"  {inv.to_string()}")
     
-    # Synthesize disjunction
-    inv_disj = solver.solve_for_coefficients(
-        var_names, init_values, update_exprs,
-        num_constraints=2, combination_type=BoolOp.OR
-    )
-    if inv_disj:
-        print(f"Disjunction: {inv_disj.to_string()}")
-    
-    # Get all combinations
-    print("\nAll synthesized invariants:")
+    print("\n--- All Synthesized Invariants ---")
     all_invs = solver.synthesize_all_combinations(
-        var_names, init_values, update_exprs, max_constraints=3
+        var_names, init_values, update_exprs, max_constraints=2
     )
     for i, inv in enumerate(all_invs):
-        print(f"  {i+1}. {inv.to_string()}")
+        eq_marker = "[EQ]" if inv.constraints[0].is_equality else "[LE]"
+        print(f"  {i+1}. {eq_marker} {inv.to_string()}")
+    
+    print("\n" + "=" * 60)
