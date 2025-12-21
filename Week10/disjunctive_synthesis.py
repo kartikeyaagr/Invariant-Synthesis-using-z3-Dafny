@@ -346,64 +346,58 @@ class DisjunctiveInvariantSynthesizer:
     
     def _synthesize_linear(self, loop: Dict, 
                           analysis: LoopPathAnalysis) -> List[str]:
-        """Synthesize simple linear invariants"""
+        """Synthesize simple linear invariants using all forms"""
         var_names = list(analysis.all_variables)
         init_values = self._get_init_values(loop)
         
         results = []
-        inv = self.solver.synthesize_disjunctive(
-            var_names, init_values, analysis, num_disjuncts=1
+        all_invs = self.solver.synthesize_all_forms(
+            var_names, init_values, analysis, self.max_disjuncts
         )
-        if inv:
-            results.append(inv.to_string())
+        
+        for inv in all_invs:
+            if inv.is_path_sensitive:
+                results.append(inv.to_conjunctive_string())
+            else:
+                results.append(inv.to_string())
         
         return results
     
     def _synthesize_disjunctive(self, loop: Dict,
                                 analysis: LoopPathAnalysis) -> List[str]:
-        """Synthesize disjunctive invariants"""
+        """Synthesize disjunctive invariants using all forms"""
         var_names = list(analysis.all_variables)
         init_values = self._get_init_values(loop)
         
         results = []
-        
-        # Try different numbers of disjuncts
-        for n in range(2, self.max_disjuncts + 1):
-            inv = self.solver.synthesize_disjunctive(
-                var_names, init_values, analysis, num_disjuncts=n
-            )
-            if inv:
-                results.append(inv.to_string())
-        
-        # Also try path-sensitive
-        inv_ps = self.solver.synthesize_path_sensitive(
-            var_names, init_values, analysis
+        all_invs = self.solver.synthesize_all_forms(
+            var_names, init_values, analysis, self.max_disjuncts
         )
-        if inv_ps:
-            results.append(inv_ps.to_conjunctive_string())
+        
+        for inv in all_invs:
+            if inv.is_path_sensitive:
+                results.append(inv.to_conjunctive_string())
+            else:
+                results.append(inv.to_string())
         
         return results
     
     def _synthesize_path_sensitive(self, loop: Dict,
                                    analysis: LoopPathAnalysis) -> List[str]:
-        """Synthesize path-sensitive invariants"""
+        """Synthesize path-sensitive invariants using all forms"""
         var_names = list(analysis.all_variables)
         init_values = self._get_init_values(loop)
         
         results = []
-        
-        inv = self.solver.synthesize_path_sensitive(
-            var_names, init_values, analysis
+        all_invs = self.solver.synthesize_all_forms(
+            var_names, init_values, analysis, self.max_disjuncts
         )
-        if inv:
-            results.append(inv.to_conjunctive_string())
         
-        # Also try simple disjunctive
-        inv_disj = self.solver.synthesize_disjunctive(
-            var_names, init_values, analysis, num_disjuncts=len(analysis.paths)
-        )
-        if inv_disj:
-            results.append(inv_disj.to_string())
+        for inv in all_invs:
+            if inv.is_path_sensitive:
+                results.append(inv.to_conjunctive_string())
+            else:
+                results.append(inv.to_string())
         
         return results
     
@@ -471,10 +465,14 @@ def main():
                        help='Coefficient bound (default: 10)')
     parser.add_argument('-d', '--max-disjuncts', type=int, default=3,
                        help='Max disjuncts (default: 3)')
+    parser.add_argument('--max-combo', type=int, default=4,
+                       help='Max invariants to combine during validation (default: 4)')
     parser.add_argument('--test', action='store_true', help='Run tests')
     parser.add_argument('--benchmark', action='store_true', help='Run benchmarks')
     parser.add_argument('--analyze', action='store_true', 
                        help='Only analyze paths, no synthesis')
+    parser.add_argument('--no-validate', action='store_true',
+                       help='Skip Dafny validation')
     parser.add_argument('--json', action='store_true', help='Output as JSON')
     
     args = parser.parse_args()
@@ -534,6 +532,85 @@ def main():
         if result.success:
             print(f"\nSynthesized {len(result.invariants)} invariant(s)")
             print(f"Synthesis type: {result.synthesis_type}")
+            
+            # Validate with Dafny if not skipped
+            if not args.no_validate:
+                print("\n" + "-" * 40)
+                print("Validating with Dafny...")
+                print("-" * 40)
+                
+                try:
+                    from dafny_verifier import DafnyVerifier
+                    verifier = DafnyVerifier()
+                    
+                    with open(args.input, 'r') as f:
+                        source = f.read()
+                    
+                    # First try each individually
+                    print("\nTrying individual invariants:")
+                    individual_valid = []
+                    for inv in result.invariants:
+                        vresult = verifier.verify_with_invariant(source, inv)
+                        status = "✓ Valid" if vresult.success else "✗ Invalid"
+                        print(f"  {inv}: {status}")
+                        if vresult.success:
+                            individual_valid.append(inv)
+                    
+                    if individual_valid:
+                        print(f"\n{len(individual_valid)} invariant(s) valid individually!")
+                        validated_invariants = individual_valid
+                        # Auto-save to synthesized folder
+                        synth_dir = os.path.join(os.path.dirname(args.input) or '.', 'synthesized')
+                        os.makedirs(synth_dir, exist_ok=True)
+                        base_name = os.path.basename(args.input)
+                        synth_path = os.path.join(synth_dir, base_name)
+                        
+                        inserter = InvariantInserter()
+                        modified = inserter.insert(source, validated_invariants)
+                        with open(synth_path, 'w') as f:
+                            f.write(modified)
+                        print(f"\n📁 Saved to: {synth_path}")
+                    else:
+                        # Try combinations
+                        print(f"\nNo single invariant sufficient. Trying combinations (up to {args.max_combo})...")
+                        
+                        # Filter promising candidates
+                        promising = []
+                        for inv in result.invariants:
+                            if ' || ' in inv or ' && ' in inv:
+                                continue  # Skip complex ones first
+                            promising.append(inv)
+                        
+                        print(f"  Filtered to {len(promising)} promising candidates")
+                        
+                        valid_set = verifier.find_minimal_valid_set(source, promising, args.max_combo)
+                        
+                        if valid_set:
+                            print(f"\n✓ Found valid combination of {len(valid_set)} invariant(s):")
+                            for inv in valid_set:
+                                print(f"    - {inv}")
+                            validated_invariants = valid_set
+                            
+                            # Auto-save to synthesized folder
+                            synth_dir = os.path.join(os.path.dirname(args.input) or '.', 'synthesized')
+                            os.makedirs(synth_dir, exist_ok=True)
+                            base_name = os.path.basename(args.input)
+                            synth_path = os.path.join(synth_dir, base_name)
+                            
+                            inserter = InvariantInserter()
+                            modified = inserter.insert(source, validated_invariants)
+                            with open(synth_path, 'w') as f:
+                                f.write(modified)
+                            print(f"\n📁 Saved to: {synth_path}")
+                        else:
+                            print("\n✗ No valid combination found.")
+                            validated_invariants = []
+                except ImportError:
+                    print("Dafny verifier not available. Skipping validation.")
+                    validated_invariants = result.invariants
+                except Exception as e:
+                    print(f"Validation error: {e}")
+                    validated_invariants = []
         else:
             print("\nNo invariants found")
     
